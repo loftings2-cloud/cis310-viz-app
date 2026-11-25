@@ -10,20 +10,48 @@ st.title("Customer & Orders Analytics")
 st.caption("Explore sales, profitability, seasonality, and returns across 2023–2026.")
 DATA_DIR = Path(__file__).resolve().parent
 
-@st.cache_data
-def read_csv(path):
+@st.cache_data(show_spinner=False)
+def parse_csv_bytes(raw: bytes, filename: str):
+    """Parse from the beginning every time, independent of upload cursor position."""
+    from io import BytesIO
+    last_error = None
     for encoding in ("utf-8-sig", "cp1252", "latin-1"):
         try:
-            return pd.read_csv(path, encoding=encoding, dtype={"Postal Code": "string"})
-        except UnicodeDecodeError:
-            continue
-    raise ValueError(f"Unable to decode {path}")
+            frame = pd.read_csv(BytesIO(raw), encoding=encoding, dtype={"Postal Code": "string"})
+            frame.columns = (frame.columns.astype(str)
+                             .str.replace("\ufeff", "", regex=False)
+                             .str.replace("ï»¿", "", regex=False).str.strip())
+            return frame
+        except (UnicodeDecodeError, pd.errors.ParserError) as exc:
+            last_error = exc
+    raise ValueError(f"Unable to parse {filename}: {last_error}")
+
+def read_csv(source, filename):
+    if hasattr(source, "getvalue"):
+        # UploadedFile is a stream; reading it without resetting can start mid-file.
+        # getvalue() always returns the entire uploaded file, irrespective of cursor.
+        raw = source.getvalue()
+    else:
+        raw = Path(source).read_bytes()
+    if not raw:
+        raise ValueError(f"{filename} is empty. Re-upload the original CSV.")
+    return parse_csv_bytes(raw, filename)
 
 @st.cache_data
 def prepare(customers, orders, returns):
     customers = customers.copy()
     orders = orders.copy()
     returns = returns.copy()
+    expected = {
+        "customers.csv": (customers, ["Customer ID", "Segment"]),
+        "orders.csv": (orders, ["Order ID", "Customer ID", "Order Date", "Ship Date", "Category", "Sales", "Profit", "Quantity", "Discount"]),
+        "returns.csv": (returns, ["Order ID", "Returned"]),
+    }
+    for filename, (table, required) in expected.items():
+        missing = [col for col in required if col not in table.columns]
+        if missing:
+            raise ValueError(f"{filename} is missing columns: {missing}. Found columns: {table.columns.tolist()}. "
+                             "The file may have been read from the middle or may not be the expected CSV. Clear the uploader and re-upload the original file.")
     for col in ("Order Date", "Ship Date"):
         orders[col] = pd.to_datetime(orders[col], errors="coerce", format="%m/%d/%Y")
     for col in ("Sales", "Profit", "Quantity", "Discount"):
@@ -40,7 +68,7 @@ def prepare(customers, orders, returns):
 
 with st.sidebar:
     st.header("Data sources")
-    st.caption("Upload all three CSV files, or keep the bundled example files.")
+    st.caption("Bundled CSV files load by default. Upload a CSV only to replace a bundled file. If a previous upload was corrupted, remove it using the X beside the upload.")
     uploads = {name: st.file_uploader(f"{name.title()} CSV", type="csv", key=name) for name in ("customers", "orders", "returns")}
 
 try:
@@ -50,8 +78,10 @@ try:
         if uploaded is None and not path.exists():
             st.error(f"Missing {name}.csv. Upload it in the sidebar or place it beside app.py.")
             st.stop()
-        tables[name] = read_csv(path)
+        tables[name] = read_csv(path, f"{name}.csv")
     df = prepare(tables["customers"], tables["orders"], tables["returns"])
+    if df["Order Date"].notna().sum() == 0:
+        raise ValueError("No valid Order Date values were found in orders.csv. Expected dates such as 11/8/2025.")
 except Exception as exc:
     st.error(f"Could not load the data: {exc}")
     st.stop()
@@ -59,8 +89,12 @@ except Exception as exc:
 valid_dates = df["Order Date"].dropna()
 with st.sidebar:
     st.header("Filters")
-    start, end = st.date_input("Order date range", value=(valid_dates.min().date(), valid_dates.max().date()),
-                               min_value=valid_dates.min().date(), max_value=valid_dates.max().date())
+    date_selection = st.date_input("Order date range", value=(valid_dates.min().date(), valid_dates.max().date()),
+                                   min_value=valid_dates.min().date(), max_value=valid_dates.max().date())
+    if not isinstance(date_selection, (tuple, list)) or len(date_selection) != 2:
+        st.info("Select both a start date and an end date.")
+        st.stop()
+    start, end = date_selection
     segments = st.multiselect("Customer segments", sorted(df["Segment"].dropna().unique()), default=sorted(df["Segment"].dropna().unique()))
     categories = st.multiselect("Product categories", sorted(df["Category"].dropna().unique()), default=sorted(df["Category"].dropna().unique()))
     st.caption("Category return rates count distinct orders per category; one order can belong to several categories.")
